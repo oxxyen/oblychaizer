@@ -1,6 +1,7 @@
 // source/daemon/parser/extractor.c
 #include <libxml/HTMLparser.h>
 #include <libxml/xpath.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include "../../../database/redis/utils/redis_store.h"

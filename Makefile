@@ -1,28 +1,31 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -std=gnu99 -O2 $(shell pkg-config --cflags libxml-2.0 libcurl hiredis)
+CFLAGS = -Wall -Wextra -std=gnu99 -O2 -D_DEFAULT_SOURCE \
+	$(shell pkg-config --cflags libxml-2.0 libcurl hiredis)
 LDFLAGS = $(shell pkg-config --libs libxml-2.0 libcurl hiredis)
 
-# Все исходники
-SRCS := main.c \
-	source/daemon/daemon.c \
-	source/daemon/storage/redis_store.c \
-	source/daemon/parser/extractor.c
-
-# Генерация объектных файлов с сохранением структуры
-OBJS := $(SRCS:%.c=build/%.o)
+OBJS = build/main.o \
+       build/daemon.o \
+       build/parser.o \
+       build/sites.o \
+       build/redis.o
 
 TARGET = vpn_parser
 
-# Правило сборки
 $(TARGET): $(OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-# Общее правило компиляции .c → .o с созданием директорий
 build/%.o: %.c
-	@mkdir -p $(dir $@)
+	mkdir -p build
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-# Очистка
+build/parser.o: source/daemon/parser/parser.c
+	mkdir -p build
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+build/redis.o: source/daemon/storage/redis.c
+	mkdir -p build
+	$(CC) $(CFLAGS) -c -o $@ $<
+
 clean:
 	rm -rf build $(TARGET)
 

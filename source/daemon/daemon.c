@@ -14,7 +14,6 @@
 
 #include "parser/sites.h"
 #include "../../database/redis/utils/redis_store.h"
-#include "parser/extractor.c"
 
 #include <curl/curl.h>
 #include <libxml/HTMLparser.h>
