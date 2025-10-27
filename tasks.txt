@@ -1,0 +1,331 @@
+Общая архитектура
+
+Parser (парсер) — поток/процесс
+Периодически загружает/скрейпит бесплатные ресурсы (списки IP/URL), парсит IP-адреса и сохраняет в файл ip_list.txt и в общую очередь ip_queue (в памяти). Дедупликация при добавлении.
+
+Daemon (демон) — главный процесс
+Загружает ip_queue в память и управляет проверками. Работает многопоточно:
+
+Worker pool — пул потоков, которые параллельно пробуют подключиться к IP, проверяют пинг, скорость, потерю пакетов.
+
+Monitor thread — следит за текущими активными подключениями (alive), регулярно проверяет их параметры; при падении переключает на следующий alive.
+
+Reaper / Retry thread — управляет await_list: периодически ре-тестирует те, что в ожидании, с экспоненциальным бэкофом.
+
+Хранилища
+
+ip_queue — очередь необработанных IP (в памяти, подкреплена файлом ip_list.txt).
+
+alive[] — массив структур активных серверов (с метриками, сокетом/сессией).
+
+await_list — очередь/счётчик для серверов с плохими метриками (в ожидании).
+
+Библиотеки и инструменты (рекомендуемые)
+
+Сетевые запросы для парсинга сайтов: libcurl (HTTP GET, таймауты, follow redirects).
+
+Пинг (ICMP): либо реализовать raw-сокеты (ICMP Echo) вручную, либо использовать библиотеку liboping если доступна. Реализация raw ICMP требует root. Для портируемости можно использовать getaddrinfo + TCP connect как проверку (не требует raw).
+
+Многопоточность: pthread.
+
+Синхронизация: pthread_mutex, pthread_cond.
+
+Асинхронный ввод/вывод: epoll (Linux) или poll/select для множества сокетов.
+
+JSON/HTML парсинг: лёгкая библиотека (например jsmn для JSON) или просто регулярные выражения/строковые функции, если ресурсы простые.
+
+Логирование: syslog или свой лог-файл с ротацией.
+
+Формат структуры данных (пример)
+typedef enum { STATE_NEW, STATE_CHECKING, STATE_ALIVE, STATE_AWAIT } ip_state_t;
+
+typedef struct {
+    char ip[64];             // "1.2.3.4" или "2001:db8::1"
+    int port;                // порт для проверки (1194, 443, 51820 и т.д.)
+    ip_state_t state;
+    double rtt_ms;           // средний RTT
+    double packet_loss;      // % потерянных пакетов
+    double throughput_kbps;  // измеренная пропускная способность (эвристика)
+    time_t last_checked;
+    int fail_count;          // для backoff
+    // возможно: socket fd, session id и т.д.
+} vpn_server_t;
+
+
+Хранилища:
+
+ip_queue — очередь vpn_server_t* защищённая mutex/cond.
+
+alive — динамический массив или хеш-таблица с mutex.
+
+await_list — очередь с отброшенными/ожидающими элементами.
+
+Логика проверки (Worker)
+
+Берём IP из ip_queue. Если пусто, sleep/cond wait.
+
+Для IP выполняем:
+
+Быстрая проверка reachability: getaddrinfo + nonblocking connect() к набору популярных VPN-портов (1194/443/51820/1701/1723). Если connect неудачен — пометить fail.
+
+ICMP ping (если есть права) 4 пакета, измеряем среднее RTT и loss. Если raw ICMP невозможен, измеряем connect RTT.
+
+Замер throughput: открываем TCP соединение и скачиваем/заливаем N байт до таймаута (если сервер не отвечает по HTTP, то throughput = estimate via sustained RTTs or mark unknown).
+
+Решение:
+
+Если RTT низкий (например < 200 ms), loss < 10% и throughput > порога (или throughput unknown but connect stable) — помещаем в alive.
+
+Иначе — в await_list с fail_count++ и next_check = now + backoff(fail_count).
+
+Monitor thread (поддержание текущего подключения)
+
+В alive поддерживать «текущий» сервер (index or pointer).
+
+Каждые monitor_interval (например 5s) проверять:
+
+Кусочек health-check: короткий ping/получить пакет статистики, либо проверка передачи данных (если у тебя есть VPN сессия, смотреть реальный throughput через TUN/TAP).
+
+Если throughput упал ниже порога или packet_loss выше порога — переключаемся:
+
+Помещаем текущий сервер в await_list (fail_count++).
+
+Берём следующий из alive (LIFO или round-robin) и создаём соединение/переключение.
+
+Если alive пуст — пытаемся оживить из await_list или ip_queue.
+
+Политика повторных попыток (backoff)
+
+Для каждого fail_count устанавливать delay: min( base * 2^fail_count, max_delay ). Например base = 30s, max = 24h.
+
+После успешного соединения сбрасываем fail_count = 0.
+
+Параллелизм и ограничения
+
+Ограничь число параллельных проверок (например 20–50), чтобы не DOS-ить источники и не расходовать ресурсы.
+
+Таймауты: connect timeout 5s, ping timeout 2s, throughput test timeout 10s.
+
+Rate limit для парсера при запросе сайтов (например 1 запрос/сек).
+
+Файловая долговечность
+
+ip_list.txt — каждой строкой ip:port и timestamp. Парсер дописывает новые. Демон при старте считывает файл и наполняет ip_queue.
+
+Для атомарных операций записи использовать временную файлку и rename().
+
+Безопасность и права
+
+ICMP raw sockets требуют root. Если не хочешь запускать демон от root, используй TCP connect как проверку.
+
+Будь аккуратен с частыми подключениями к чужим серверам — это может выглядеть как сканирование. Соблюдай правило "не DOS".
+
+Псевдокод — основной цикл демона
+int main() {
+    load_ip_list_from_file("ip_list.txt", &ip_queue);
+    start_thread(parser_thread);
+    start_thread(manager_thread); // запускает worker pool, monitor, reaper
+    // demon loop: wait for signals, graceful shutdown
+}
+
+
+manager_thread:
+
+// spawn N worker threads that execute worker_main()
+spawn_workers(N);
+
+while (!shutdown) {
+    // monitor alive/current
+    check_current_alive();
+    sleep(monitor_interval);
+}
+
+
+worker_main:
+
+while (!shutdown) {
+    vpn = dequeue(ip_queue, timeout);
+    if (!vpn) continue;
+    vpn->state = STATE_CHECKING;
+    perform_connect_checks(vpn); // connect, ping, throughput
+    if (is_good(vpn)) add_to_alive(vpn);
+    else add_to_await(vpn);
+}
+
+Метрики и пороги (пример)
+
+RTT (ping) < 200 ms — хорошее, 200–500 — среднее, >500 — плохое.
+
+Packet loss < 5% — хороший, 5–20% — средний, >20% — плохой.
+
+Throughput: порог зависит от задачи, например > 500 kbps — приемлемо для лёгкого туннелирования.
+
+Логи и мониторинг
+
+Логируй события: CHECK_OK, CHECK_FAIL, SWITCH_ACTIVE, PARSER_ADD, PARSER_ERR.
+
+Экспонируй простой HTTP /status endpoint (libmicrohttpd или простая socket-реализация) для просмотра текущих alive/await stats.
+
+Ограничения и реалистичные упрощения
+
+Реально измерять «скорость VPN» сложно без установки VPN-сессии и обмена трафиком через туннель. Описанные эвристики (ping, tcp connect, короткий tcp throughput test) дают лишь приближение.
+
+Для точной проверки скорости надо уметь инициировать туннель (например OpenVPN/ WireGuard) и тестировать через него. Это значительно усложняет проект (требует root, настройку туннеля, авторизацию, возможно ключей). Если цель — просто выбрать «живой и быстрый» сервер, эвристики подходят.
+
+Если серверы возвращаются как домены, учти DNS-резолвинг и обновление IP.
+
+Дополнительно: последовательность разработки (итерации)
+
+Минимум работоспособности (MVP):
+
+Парсер: читает 1 сайт/файл и наполняет ip_queue.
+
+Worker: проверяет connect (nonblocking) + measure RTT via connect.
+
+alive/await lists, простая логика переключения.
+
+Добавить ICMP и packet loss измерение (если можно запускать с правами).
+
+Добавить throughput тест (ограниченный, безопасный).
+
+Добавить backoff, парсер множества источников, дедупликацию.
+
+Добавить полноценный мониторинг и graceful shutdown.
+
+Опционально: интеграция с OpenVPN/WireGuard для реальных speed tests.
+
+Пример команд/файлов для старта
+
+ip_list.txt — начальный файл с парами ip:port.
+
+Запуск: sudo ./vpn_daemon -c config.json (если нужно ICMP).
+
+Конфиг: thresholds, parallelism, parser_urls[], monitor_interval, log_file.
+
+Небольшой скелет функций (заготовка)
+// parse.c
+void *parser_thread(void *arg);
+
+// worker.c
+void *worker_main(void *arg);
+int check_server(vpn_server_t *s); // делает connect/ping/throughput
+
+// monitor.c
+void *monitor_thread(void *arg);
+
+// storage.c
+void load_ip_list(const char *path);
+void save_ip_list(const char *path);
+
+// utils.c
+int tcp_connect_timeout(const char *host, int port, int timeout_ms);
+double measure_rtt(const char *host);
+double measure_throughput(const char *host, int port, int timeout_ms);
+
+Заключение и следующее действие
+
+Хороший путь — начать с MVP (пункты итерации 1 и 2). Если хочешь, могу:
+
+Сгенерировать конкретный каркас проекта на C (файлы, заголовки, базовая реализация worker + manager) прямо сейчас.
+
+Или написать пример кода для tcp_connect_timeout() и очереди потокобезопасной ip_queue.
+
+Ключевые руководства и книги (читай сначала)
+
+Beej’s Guide to Network Programming — отличный ввод в сокеты (TCP/UDP), non-blocking connect, timeout’ы, getaddrinfo. Очень практично для начала. 
+beej.us
++1
+
+UNIX Network Programming (W. R. Stevens) — глубже про raw-сокеты, ICMP, детали TCP/IP. Берём, когда захочешь понять «почему» и реализовать ping на raw-сокетах. 
+doc.lagout.org
++1
+
+The Linux Programming Interface (Kerrisk) — системное программирование: процессы, дескрипторы, select/poll/epoll, работа с файлами и потоками. Очень полезно для демонов. (ищи соответствующую главу про poll/epoll). 
+doc.lagout.org
+
+Практические онлайн-руководства (быстро и по делу)
+
+libcurl C tutorial & examples — как скачивать страницы, парсить HTML/JSON и делать HTTP-запросы (парсер сайтов для ip_list). Обязательно изучи примеры. 
+curl.se
++1
+
+epoll tutorial — простая и понятная инструкция по epoll для работы с большим числом сокетов. Нужна, если будешь мониторить много соединений. 
+suchprogramming.com
++1
+
+liboping (ping library) — готовая C-библиотека для ICMP echo (не нужно писать raw ICMP самому, если не хочешь запускать под root). Отлично для измерения RTT и потерь. 
+noping.cc
++1
+
+Библиотеки и утилиты, которые стоит посмотреть
+
+libcurl — HTTP GET/POST, таймауты, параллельные загрузки (использовать в парсере). 
+curl.se
+
+liboping — для ping/ICMP в C без лишних костылей. 
+noping.cc
++1
+
+pthread — потоковая синхронизация: мьютексы, condition variables (producer/consumer для ip_queue). Примеры в документации/гугах. 
+docs.oracle.com
+
+Темы, которые нужно изучить и в каком порядке (конкретно)
+
+Основы сокетов в C (TCP/UDP) — Beej, примеры connect(), send(), recv(). Практика: простая клиент-серверная пара. 
+beej.us
+
+Non-blocking connect / timeout — учись делать неблокирующие connect() + select/poll для таймаута (Beej имеет примеры). Практика: написать tcp_connect_timeout() и протестировать на нескольких IP. 
+beej.us
+
+Параллельность: pthreads, mutex, condvar — producer/consumer для очереди адресов. Сделай пул потоков-воркеров. 
+docs.oracle.com
+
+ICMP/ping: raw vs liboping — если не хочешь работать под root — используй liboping; иначе читай Stevens про raw sockets. Практика: реализовать 4-пакетный ping и вычислять packet loss/RRT. 
+noping.cc
++1
+
+Измерение скорости (throughput) — простая эвристика: установить TCP-соединение и скачать/залить N байт с таймаутом; или реже — интеграция с OpenVPN/WireGuard и тест внутри туннеля (сложно). На обсуждениях — идеи и примеры (iPerf-like). Практика: реализуй простой клиент, который принимает и считывает N байт, вычисляет kbps. 
+Stack Overflow
++1
+
+Event loop для множества соединений — epoll/poll/select — нужен, если количество проверок большое. Практика: пример «несколько неблокирующих connect и wait на все» с epoll. 
+suchprogramming.com
++1
+
+Демон/сервис (systemd) — как сделать сервис, логирование, graceful shutdown. Практика: написать unit-файл и запустить как systemd-сервис. 
+Medium
+
+Конкретные статьи/страницы для быстрого старта (ссылки и почему)
+
+Beej’s Guide (сокеты, nonblocking): быстро читать и кодить. 
+beej.us
+
+libcurl tutorial + examples — для парсера и HTTP. 
+curl.se
++1
+
+epoll tutorial — для массового мониторинга сокетов. 
+suchprogramming.com
+
+liboping — готовая библиотека для пинга. 
+noping.cc
+
+Stevens / UNIX Network Programming — когда будешь делать raw ICMP или углубляться в TCP-детали. 
+doc.lagout.org
+
+Практические упражнения (делай прямо сейчас)
+
+Напиши tcp_connect_timeout(host,port,timeout_ms) — используй nonblocking connect + select. Тестируй на известных IP. (Beej + примеры libcurl помогут). 
+beej.us
++1
+
+Сделай маленький парсер: скачай страницу с помощью libcurl, вытащи IP с помощью простого регулярного поиска и запиши в ip_list.txt. 
+curl.se
+
+Реализуй worker pool: потоки берут IP из очереди и запускают tcp_connect_timeout. Логируй результат. Используй pthreads. 
+docs.oracle.com
+
+Добавь ping через liboping (или system ping на старте) и вычисли rtt + loss. 
+noping.cc
+
+Прототип throughput: клиент и сервер (локально) — измерь скорость передачи N байт, чтобы понять как вычислять kbps. Потом применишь к внешним серверам.
