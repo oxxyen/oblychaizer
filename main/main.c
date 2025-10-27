@@ -1,12 +1,7 @@
 #include <stdio.h>
-#include <stdlib.h>
+#include "../source/daemon/resource/daemon.h"
 
-int main(void) {
-
-    for (int i = 0; i < 10; i++) {
-
-        printf("hello world/!\n");
-
-    }
-    
+int main(int argc, char *argv[]) {
+    printf("[*] Starting VPN Parser Daemon...\n");
+    return start_daemon();
 }

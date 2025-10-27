@@ -1,3 +1,6 @@
 # Build and Install Components Project for Arch Linux
 
-sudo pacman -S curl libxml2
+# sudo pacman -S curl libxml2
+echo "Starting builds..."
+make clean
+make
