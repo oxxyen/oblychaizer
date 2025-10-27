@@ -3,28 +3,39 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
-#include <time.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
-
+#include <pthread.h>
+#include <sys/wait.h>
+#include <sys/types.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <time.h>
 
+#include <hiredis/hiredis.h>
+
+#define REDIS_HOST "127.0.0.1"
+#define REDIS_PORT 6379
+
+#define IP_QUEUE_KEY "ip_queue"
+#define ALIVE_SET_KEY "alive"
+#define AWAIT_LIST_KEY "await_list"
+#define METRICS_PREFIX "ip:metrics:"
+
+#define MAX_WORKERS 6
+#define TCP_TIMEOUT_SEC 3
+#define TESTER_TIMEOUT_SEC 10
 
 typedef struct {
 
-    int client_port = 7677;
-    char client_ip[10] = "127.0.0.1";
-
-    struct sockaddr_in sock_addr;
-
-} client_sock_t;
-
-typedef struct {
-
-    int p;
+// todo:
 
 } ip_state_t;
+
 
 typedef struct {
 
